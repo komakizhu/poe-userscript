@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Poe Effort & Points Monitor
 // @namespace    https://poe.com/
-// @version      1.1.1
-// @description  在 Poe 中保守地管理 Effort，并显示积分百分比与最近一轮的官方费用。
+// @version      1.2.1
+// @description  在 Poe 中固定阅读位置、保守地管理 Effort，并显示积分百分比与最近一轮的官方费用。
 // @author       xiadengma (积分逻辑来源) + OpenAI
 // @match        https://poe.com/*
 // @match        https://www.poe.com/*
@@ -40,6 +40,7 @@
         autoLow: true,
         sendGuard: true,
         strictGuard: false,
+        readingLock: true,
         debug: false
     });
     const LEVELS = Object.freeze(['low', 'medium', 'high', 'xhigh', 'max', 'none']);
@@ -340,6 +341,419 @@
         });
     }
 
+    function createReadingPositionGuard(win, onState = () => {}) {
+        const doc = win.document;
+        const messageSelector = '[id^="message-"]';
+        const uiSelector = '[data-poe-effort-points-ui="root"]';
+        const editorSelector = 'input,textarea,select,[contenteditable]:not([contenteditable="false"]),[role="textbox"],[role="combobox"]';
+        let enabled = false;
+        let scroller = null;
+        let anchor = null;
+        let lockedTop = 0;
+        let route = '';
+        let frame = null;
+        let settleTimer = null;
+        let settleDeadline = 0;
+        let settling = false;
+        let restoring = false;
+        let correctedTop = null;
+        let draggingScrollbar = false;
+        let touch = null;
+        let observer = null;
+        let resizeObserver = null;
+        let observedSizes = [];
+        let savedStyles = [];
+        let lastState = '';
+        const listeners = [];
+
+        function publish() {
+            const available = Boolean(scroller && scroller.isConnected && scroller.querySelector(messageSelector));
+            const status = !enabled ? 'off' : !available ? 'waiting' : settling ? 'settling' : 'locked';
+            const key = `${status}:${available}`;
+            if (key === lastState) return;
+            lastState = key;
+            onState({ status, canJump: available });
+        }
+
+        function viewport() {
+            if (scroller === doc.scrollingElement) {
+                return { top: 0, bottom: win.innerHeight, left: 0, right: win.innerWidth };
+            }
+            const rect = scroller.getBoundingClientRect();
+            const top = Math.max(0, rect.top + scroller.clientTop);
+            return { top, bottom: Math.min(win.innerHeight, rect.top + scroller.clientTop + scroller.clientHeight),
+                left: Math.max(0, rect.left), right: Math.min(win.innerWidth, rect.right) };
+        }
+
+        function findScroller() {
+            const messages = Array.from(doc.querySelectorAll(messageSelector)).filter(message =>
+                message.isConnected && message.getClientRects().length && !message.closest('dialog,[role="dialog"],aside,nav'));
+            if (!messages.length) return null;
+            const candidates = [];
+            for (let parent = messages[messages.length - 1].parentElement; parent; parent = parent.parentElement) {
+                if (!parent.contains(messages[0]) || parent.clientHeight <= 0 ||
+                    !/^(auto|scroll|overlay)$/.test(win.getComputedStyle(parent).overflowY)) continue;
+                const candidate = parent === doc.body || parent === doc.documentElement ? doc.scrollingElement : parent;
+                if (candidate && !candidates.includes(candidate)) candidates.push(candidate);
+            }
+            // overflow-x:hidden also computes overflow-y:auto on message
+            // wrappers. Prefer a real scroll range shared by the conversation,
+            // rather than accidentally locking just the newest reply's wrapper.
+            return candidates.find(element => element.scrollHeight > element.clientHeight + 1 || Math.abs(element.scrollTop) > 1) ||
+                candidates[candidates.length - 1] || (doc.scrollingElement && doc.scrollingElement.clientHeight > 0 ? doc.scrollingElement : null);
+        }
+
+        function protectStyles() {
+            for (const entry of savedStyles) {
+                const style = scroller.style;
+                if (style.getPropertyValue(entry.name) === entry.applied && style.getPropertyPriority(entry.name) === 'important') continue;
+                entry.value = style.getPropertyValue(entry.name);
+                entry.priority = style.getPropertyPriority(entry.name);
+                entry.owned = true;
+                style.setProperty(entry.name, entry.applied, 'important');
+            }
+        }
+
+        function measureText(node, offset) {
+            if (!node || !node.isConnected || node.nodeType !== 3 || offset >= node.length) return null;
+            const range = doc.createRange();
+            range.setStart(node, offset);
+            range.setEnd(node, offset + 1);
+            const rect = range.getBoundingClientRect();
+            return rect.height > 0 ? rect : null;
+        }
+
+        function captureAnchor() {
+            const box = viewport();
+            if (box.bottom <= box.top) return null;
+            const y = box.top + Math.min(32, (box.bottom - box.top) / 4);
+            for (const fraction of [0.5, 0.35, 0.65]) {
+                const x = box.left + (box.right - box.left) * fraction;
+                const hits = doc.elementsFromPoint ? doc.elementsFromPoint(x, y) : [];
+                const hit = hits.find(element => scroller.contains(element) && element.closest(messageSelector) &&
+                    !element.closest(`button,${editorSelector},${uiSelector}`));
+                if (!hit) continue;
+                const message = hit.closest(messageSelector);
+                const element = hit.closest(`p,li,pre,blockquote,h1,h2,h3,h4,h5,h6,td,th,${messageSelector}`) || message;
+                const result = { viewportTop: box.top, element, elementY: element.getBoundingClientRect().top - box.top,
+                    message, messageY: message.getBoundingClientRect().top - box.top };
+                // Keep only a DOM reference and a character offset, never a copy
+                // of the message. A text anchor also survives line wrapping.
+                const caret = doc.caretPositionFromPoint ? doc.caretPositionFromPoint(x, y) : null;
+                const range = !caret && doc.caretRangeFromPoint ? doc.caretRangeFromPoint(x, y) : null;
+                const node = caret ? caret.offsetNode : range && range.startContainer;
+                const offset = caret ? caret.offset : range && range.startOffset;
+                if (node && message.contains(node)) {
+                    const rect = measureText(node, offset);
+                    if (rect && rect.bottom > box.top && rect.top < box.bottom) {
+                        Object.assign(result, { node, offset, textY: rect.top - box.top });
+                    }
+                }
+                return result;
+            }
+            const message = Array.from(scroller.querySelectorAll(messageSelector)).find(element => {
+                const rect = element.getBoundingClientRect();
+                return rect.bottom > box.top && rect.top < box.bottom;
+            });
+            return message ? { viewportTop: box.top, element: message, elementY: message.getBoundingClientRect().top - box.top } : null;
+        }
+
+        function observeSizes() {
+            if (!resizeObserver) return;
+            const elements = [...new Set([scroller, scroller.firstElementChild, anchor && anchor.element, anchor && anchor.message].filter(Boolean))];
+            if (elements.length === observedSizes.length && elements.every((element, index) => element === observedSizes[index])) return;
+            resizeObserver.disconnect();
+            observedSizes = elements;
+            for (const element of elements) resizeObserver.observe(element);
+        }
+
+        function capture() {
+            lockedTop = scroller.scrollTop;
+            anchor = captureAnchor();
+            observeSizes();
+        }
+
+        function restore() {
+            if (!scroller || !scroller.isConnected || settling || restoring || draggingScrollbar) return;
+            restoring = true;
+            try {
+                protectStyles();
+                const box = viewport();
+                let delta = null;
+                if (anchor) {
+                    const textRect = measureText(anchor.node, anchor.offset);
+                    if (textRect) delta = textRect.top - box.top - anchor.textY;
+                    else if (anchor.element.isConnected) delta = anchor.element.getBoundingClientRect().top - box.top - anchor.elementY;
+                    else if (anchor.message && anchor.message.isConnected) delta = anchor.message.getBoundingClientRect().top - box.top - anchor.messageY;
+                }
+                const desired = delta === null ? lockedTop : scroller.scrollTop + delta;
+                if (Math.abs(scroller.scrollTop - desired) > 0.5) {
+                    const before = scroller.scrollTop;
+                    scroller.scrollTop = desired;
+                    if (Math.abs(scroller.scrollTop - before) > 0.5) correctedTop = scroller.scrollTop;
+                }
+                lockedTop = scroller.scrollTop; // Let the browser clamp either positive or negative scrollTop.
+                if (delta === null || Math.abs(lockedTop - desired) > 1 ||
+                    (anchor && (!anchor.element.isConnected || (anchor.node && !anchor.node.isConnected)))) capture();
+            } finally {
+                restoring = false;
+            }
+        }
+
+        function finishSettling() {
+            if (!scroller || !settling) return;
+            win.clearTimeout(settleTimer);
+            settleTimer = null;
+            settling = false;
+            protectStyles();
+            capture();
+            publish();
+        }
+
+        function scheduleSettling() {
+            win.clearTimeout(settleTimer);
+            settleTimer = win.setTimeout(finishSettling, Math.max(0, Math.min(250, settleDeadline - Date.now())));
+        }
+
+        function release() {
+            win.clearTimeout(settleTimer);
+            settleTimer = null;
+            if (resizeObserver) resizeObserver.disconnect();
+            observedSizes = [];
+            if (scroller) {
+                for (const entry of savedStyles) {
+                    if (!entry.owned || scroller.style.getPropertyValue(entry.name) !== entry.applied || scroller.style.getPropertyPriority(entry.name) !== 'important') continue;
+                    if (entry.value) scroller.style.setProperty(entry.name, entry.value, entry.priority);
+                    else scroller.style.removeProperty(entry.name);
+                }
+            }
+            savedStyles = [];
+            scroller = null;
+            anchor = null;
+            settling = false;
+            draggingScrollbar = false;
+            correctedTop = null;
+            touch = null;
+        }
+
+        function refresh() {
+            if (!enabled) return;
+            if (route !== win.location.href) {
+                route = win.location.href;
+                release();
+            }
+            const nextScroller = findScroller();
+            if (nextScroller && nextScroller !== scroller) {
+                const preserve = Boolean(scroller && !settling);
+                const previousAnchor = anchor;
+                const previousTop = lockedTop;
+                release();
+                scroller = nextScroller;
+                if (scroller) {
+                    savedStyles = [{ name: 'overflow-anchor', applied: 'none' }, { name: 'scroll-behavior', applied: 'auto' }];
+                    if (preserve) {
+                        // A same-chat re-render must not reopen the initial-load
+                        // grace period and let an old follow-bottom state win.
+                        anchor = previousAnchor;
+                        lockedTop = previousTop;
+                        if (anchor) {
+                            const top = viewport().top;
+                            const shift = anchor.viewportTop - top;
+                            for (const key of ['elementY', 'messageY', 'textY']) {
+                                if (Number.isFinite(anchor[key])) anchor[key] += shift;
+                            }
+                            anchor.viewportTop = top;
+                        }
+                        protectStyles();
+                        observeSizes();
+                    } else {
+                        // Allow Poe to restore the initial chat position. Only
+                        // initial loading/navigation has this grace period.
+                        settling = true;
+                        settleDeadline = Date.now() + 1500;
+                        scheduleSettling();
+                    }
+                }
+            }
+            restore();
+            publish();
+        }
+
+        function scheduleRefresh() {
+            if (!enabled || frame !== null) return;
+            frame = win.requestAnimationFrame(() => { frame = null; refresh(); });
+        }
+
+        function inputBelongsToChat(target) {
+            const element = target && (target.nodeType === 1 ? target : target.parentElement);
+            if (!scroller || !element || !scroller.contains(element) || element.closest(`${editorSelector},${uiSelector},dialog,[role="dialog"],[role="menu"],[role="listbox"],aside,nav`)) return false;
+            for (let parent = element; parent && parent !== scroller; parent = parent.parentElement) {
+                if (parent.scrollHeight > parent.clientHeight + 1 && /^(auto|scroll|overlay)$/.test(win.getComputedStyle(parent).overflowY)) return false;
+            }
+            return true;
+        }
+
+        function move(top) {
+            finishSettling();
+            restore();
+            correctedTop = null;
+            scroller.scrollTop = top;
+            capture();
+        }
+
+        function onWheel(event) {
+            refresh();
+            if (!scroller || !scroller.isConnected) return;
+            const path = event.composedPath ? event.composedPath() : [event.target];
+            const ownBottom = path.some(element => element && element.id === 'reading-bottom') &&
+                path.some(element => element && element.matches && element.matches(uiSelector));
+            if (!(inputBelongsToChat(event.target) || bottomButton(event.target) || ownBottom) || event.ctrlKey || event.metaKey || event.shiftKey ||
+                !event.deltaY || Math.abs(event.deltaX) > Math.abs(event.deltaY)) return;
+            finishSettling();
+            restore();
+            const line = parseFloat(win.getComputedStyle(scroller).lineHeight) || 20;
+            const delta = event.deltaY * (event.deltaMode === 1 ? line : event.deltaMode === 2 ? scroller.clientHeight : 1);
+            if (event.cancelable) event.preventDefault();
+            // Apply this input ourselves. A time-based "user is scrolling"
+            // allowance would also let Poe's jump through after every gesture.
+            move(scroller.scrollTop + delta);
+        }
+
+        function jumpToBottom() {
+            refresh();
+            if (!scroller) return;
+            move(win.getComputedStyle(scroller).flexDirection === 'column-reverse' ? 0 : scroller.scrollHeight);
+        }
+
+        function bottomButton(target) {
+            const button = target && target.closest && target.closest('button,[role="button"]');
+            if (!button || button.closest(uiSelector)) return false;
+            const name = normalizeText(button.getAttribute('aria-label') || button.getAttribute('title') || button.textContent);
+            return /^(?:(?:scroll|jump|go)\s+to\s+(?:the\s+)?(?:bottom|latest(?:\s+message)?|newest(?:\s+message)?)|回到底部|滚动到底部|跳[至到](?:底部|最新(?:消息)?)|向下滚动)[.!。！]?$/i.test(name);
+        }
+
+        function onKeyDown(event) {
+            if (bottomButton(event.target) && (event.key === 'Enter' || event.key === ' ')) { jumpToBottom(); return; }
+            refresh();
+            const target = event.target;
+            if (!scroller || !target || target.closest(`${editorSelector},button,[role="button"],a[href],${uiSelector},dialog,[role="dialog"],[role="menu"],[role="listbox"]`) ||
+                event.altKey || event.metaKey || (event.ctrlKey && !['Home', 'End'].includes(event.key))) return;
+            if (target !== doc.body && target !== doc.documentElement && !inputBelongsToChat(target)) return;
+            const page = scroller.clientHeight * 0.9;
+            const deltas = { ArrowUp: -40, ArrowDown: 40, PageUp: -page, PageDown: page, ' ': event.shiftKey ? -page : page };
+            if (!(event.key in deltas) && event.key !== 'Home' && event.key !== 'End') return;
+            event.preventDefault();
+            finishSettling();
+            restore();
+            const reversed = win.getComputedStyle(scroller).flexDirection === 'column-reverse';
+            move(event.key === 'Home' ? (reversed ? -scroller.scrollHeight : 0) :
+                event.key === 'End' ? (reversed ? 0 : scroller.scrollHeight) : scroller.scrollTop + deltas[event.key]);
+        }
+
+        function onScroll(event) {
+            if (!scroller || (event.target !== scroller && !(scroller === doc.scrollingElement && event.target === doc))) return;
+            if (settling) scheduleSettling();
+            else if (draggingScrollbar) { correctedTop = null; capture(); }
+            else {
+                const correction = correctedTop !== null && Math.abs(scroller.scrollTop - correctedTop) <= 0.5;
+                correctedTop = null;
+                restore();
+                // Correcting a site-driven jump must not itself trigger Poe's
+                // follow-bottom callback again. User scrolls still reach the
+                // page, so history loading and normal scroll state can work.
+                if (correction || correctedTop !== null) event.stopImmediatePropagation();
+            }
+        }
+
+        function onPointerDown(event) {
+            if (!scroller || event.button !== 0 || (event.pointerType && event.pointerType !== 'mouse')) return;
+            const box = viewport();
+            if ((event.target === scroller || (scroller === doc.scrollingElement && event.target === doc.documentElement)) &&
+                event.clientY >= box.top && event.clientY <= box.bottom &&
+                (Math.abs(event.clientX - box.right) < 18 || Math.abs(event.clientX - box.left) < 18)) {
+                finishSettling();
+                correctedTop = null;
+                draggingScrollbar = true;
+            }
+        }
+
+        function onPointerUp() {
+            if (draggingScrollbar && scroller) { draggingScrollbar = false; capture(); }
+        }
+
+        function onTouchStart(event) {
+            refresh();
+            touch = event.touches.length === 1 && inputBelongsToChat(event.target)
+                ? { x: event.touches[0].clientX, y: event.touches[0].clientY } : null;
+        }
+
+        function onTouchMove(event) {
+            if (!touch || event.touches.length !== 1 || !scroller) { touch = null; return; }
+            const next = event.touches[0];
+            const delta = touch.y - next.clientY;
+            const horizontal = Math.abs(touch.x - next.clientX);
+            touch = { x: next.clientX, y: next.clientY };
+            if (!delta || horizontal > Math.abs(delta)) return;
+            if (event.cancelable) event.preventDefault();
+            finishSettling();
+            restore();
+            move(scroller.scrollTop + delta);
+        }
+
+        function listen(target, type, handler, options = true) {
+            target.addEventListener(type, handler, options);
+            listeners.push(() => target.removeEventListener(type, handler, options));
+        }
+
+        function start() {
+            if (enabled) return;
+            enabled = true;
+            if (win.ResizeObserver) resizeObserver = new win.ResizeObserver(scheduleRefresh);
+            observer = new win.MutationObserver(mutations => {
+                if (mutations.some(mutation => {
+                    const element = mutation.target.nodeType === 1 ? mutation.target : mutation.target.parentElement;
+                    return !element || !element.closest(uiSelector);
+                })) scheduleRefresh();
+            });
+            observer.observe(doc.documentElement, { childList: true, subtree: true, characterData: true,
+                attributes: true, attributeFilter: ['class', 'style', 'hidden'] });
+            listen(win, 'wheel', onWheel, { capture: true, passive: false });
+            listen(doc, 'keydown', onKeyDown);
+            listen(win, 'scroll', onScroll);
+            const pointer = win.PointerEvent ? 'pointer' : 'mouse';
+            listen(doc, `${pointer}down`, onPointerDown);
+            listen(doc, `${pointer}up`, onPointerUp);
+            listen(doc, 'pointercancel', onPointerUp);
+            listen(win, 'blur', event => { if (event.target === win) onPointerUp(); });
+            listen(doc, 'touchstart', onTouchStart, { capture: true, passive: true });
+            listen(doc, 'touchmove', onTouchMove, { capture: true, passive: false });
+            listen(doc, 'touchend', () => { touch = null; });
+            listen(doc, 'touchcancel', () => { touch = null; });
+            listen(doc, 'click', event => { if (bottomButton(event.target)) jumpToBottom(); });
+            listen(doc, 'load', scheduleRefresh);
+            listen(win, 'resize', scheduleRefresh);
+            listen(win, 'popstate', refresh);
+            listen(win, 'hashchange', refresh);
+            if (doc.fonts && doc.fonts.addEventListener) listen(doc.fonts, 'loadingdone', scheduleRefresh);
+            refresh();
+        }
+
+        function stop() {
+            enabled = false;
+            for (const remove of listeners.splice(0)) remove();
+            if (observer) observer.disconnect();
+            if (resizeObserver) resizeObserver.disconnect();
+            observer = null;
+            resizeObserver = null;
+            if (frame !== null) win.cancelAnimationFrame(frame);
+            frame = null;
+            release();
+            publish();
+        }
+
+        return Object.freeze({ start, stop, refresh, jumpToBottom });
+    }
+
     function parseResetText(value) {
         const lines = String(value || '').split(/[\r\n]+/).map(normalizeText).filter(Boolean);
         const resetPattern = /reset|resets|renew|renews|重置|刷新积分/i;
@@ -483,6 +897,7 @@
             percentUpdatedAt: 0,
             roundUsage: { points: null, status: 'loading' },
             effortStatus: { kind: 'unknown', level: null, label: 'None' },
+            readingPosition: { status: 'waiting', canJump: false },
             statusMessage: '正在检查 Poe 页面…',
             allowOnce: false
         };
@@ -553,6 +968,7 @@
                 this.allowButton = null;
                 this.onSettingChange = null;
                 this.onAllowOnce = null;
+                this.onJumpToBottom = null;
             }
 
             mount() {
@@ -586,6 +1002,7 @@
                         button { border:1px solid rgba(128,128,128,.38); border-radius:6px;
                             padding:5px 8px; background:ButtonFace; color:ButtonText; cursor:pointer; }
                         .allow { margin-top:6px; }
+                        .reading-tools { display:flex; justify-content:flex-end; margin-top:5px; }
                         .note { margin-top:7px; opacity:.72; }
                         @media (prefers-color-scheme: dark) {
                             .card { border-color:rgba(255,255,255,.18); }
@@ -604,24 +1021,30 @@
                                 <div class="row"><span>积分重置</span><span class="value" id="reset">未知</span></div>
                                 <div class="row"><span>最近一轮用量</span><span class="value" id="usage">读取中</span></div>
                                 <div class="row"><span>Effort</span><span class="value" id="effort">检测中</span></div>
+                                <div class="row"><span>阅读位置</span><span class="value" id="reading-state">等待聊天</span></div>
                                 <div class="status" id="status" role="status">正在检查 Poe 页面…</div>
                                 <button class="allow" id="allow-once" type="button" hidden>本次允许发送</button>
                                 <div class="settings">
                                     <label><input id="auto-low" type="checkbox"> 自动选择 Low</label>
                                     <label><input id="send-guard" type="checkbox"> 发送前保护</label>
                                     <label><input id="strict-guard" type="checkbox"> 严格保护（未知时拦截）</label>
+                                    <label><input id="reading-lock" type="checkbox"> 固定阅读位置（阻止自动跳动）</label>
                                     <label><input id="debug" type="checkbox"> 调试日志</label>
                                 </div>
                                 <div class="note" id="usage-note">本次用量是最近一轮回复的官方费用。</div>
                             </div>
                         </details>
+                        <div class="reading-tools"><button id="reading-bottom" type="button" hidden>回到底部</button></div>
                     </div>`;
                 (doc.body || doc.documentElement).appendChild(this.host);
                 this.allowButton = this.root.querySelector('#allow-once');
                 this.root.querySelector('#allow-once').addEventListener('click', () => {
                     if (this.onAllowOnce) this.onAllowOnce();
                 });
-                for (const [id, key] of [['auto-low', 'autoLow'], ['send-guard', 'sendGuard'], ['strict-guard', 'strictGuard'], ['debug', 'debug']]) {
+                this.root.querySelector('#reading-bottom').addEventListener('click', () => {
+                    if (this.onJumpToBottom) this.onJumpToBottom();
+                });
+                for (const [id, key] of [['auto-low', 'autoLow'], ['send-guard', 'sendGuard'], ['strict-guard', 'strictGuard'], ['reading-lock', 'readingLock'], ['debug', 'debug']]) {
                     const input = this.root.querySelector(`#${id}`);
                     input.checked = Boolean(state.settings[key]);
                     input.disabled = true;
@@ -666,8 +1089,11 @@
                                 : `官方费用读取失败或尚未提供${usageState.failureReason ? `（${usageState.failureReason}）` : ''}；返回此标签页时重新核对。`;
                 this.root.querySelector('#effort').textContent = effort;
                 this.root.querySelector('#effort-short').textContent = `Effort：${effort}`;
+                this.root.querySelector('#reading-state').textContent = ({ off: '已关闭', waiting: '等待聊天', settling: '页面载入中', locked: '已固定，可手动滚动' })[state.readingPosition.status];
+                const bottom = this.root.querySelector('#reading-bottom');
+                bottom.hidden = !state.settings.readingLock || !state.readingPosition.canJump;
                 this.root.querySelector('#status').textContent = state.statusMessage;
-                for (const [id, key] of [['auto-low', 'autoLow'], ['send-guard', 'sendGuard'], ['strict-guard', 'strictGuard'], ['debug', 'debug']]) {
+                for (const [id, key] of [['auto-low', 'autoLow'], ['send-guard', 'sendGuard'], ['strict-guard', 'strictGuard'], ['reading-lock', 'readingLock'], ['debug', 'debug']]) {
                     const input = this.root.querySelector(`#${id}`);
                     if (input) input.checked = Boolean(state.settings[key]);
                 }
@@ -681,6 +1107,10 @@
         }
 
         const ui = new UIManager();
+        const readingGuard = createReadingPositionGuard(win, readingPosition => {
+            state.readingPosition = readingPosition;
+            ui.render();
+        });
 
         function visible(element) {
             if (!element || !element.isConnected || element.hidden || element.getAttribute('aria-hidden') === 'true') return false;
@@ -1743,6 +2173,7 @@
             }
 
             checkContext() {
+                readingGuard.refresh();
                 const currentRoute = win.location.href;
                 if (currentRoute !== this.route) {
                     this.route = currentRoute;
@@ -1849,6 +2280,7 @@
                 clearTimers();
                 this.pause();
                 sendGuard.remove();
+                readingGuard.stop();
                 doc.removeEventListener('click', manualEffortHandler, true);
                 doc.removeEventListener('keydown', manualEffortHandler, true);
                 doc.removeEventListener('change', manualEffortHandler, true);
@@ -1866,6 +2298,7 @@
                 running = true;
                 this.start();
                 sendGuard.install();
+                if (state.settings.readingLock) readingGuard.start();
                 doc.addEventListener('click', manualEffortHandler, true);
                 doc.addEventListener('keydown', manualEffortHandler, true);
                 doc.addEventListener('change', manualEffortHandler, true);
@@ -2136,11 +2569,13 @@
             turnTracker,
             lifecycle,
             sendGuard,
+            readingGuard,
             stop() {
                 running = false;
                 clearTimers();
                 lifecycle.stop();
                 sendGuard.remove();
+                readingGuard.stop();
                 doc.removeEventListener('click', manualEffortHandler, true);
                 doc.removeEventListener('keydown', manualEffortHandler, true);
                 doc.removeEventListener('change', manualEffortHandler, true);
@@ -2164,6 +2599,7 @@
                     autoLow: saved.autoLow !== false,
                     sendGuard: saved.sendGuard !== false,
                     strictGuard: saved.strictGuard === true,
+                    readingLock: saved.readingLock !== false,
                     debug: saved.debug === true
                 };
             }
@@ -2171,10 +2607,14 @@
             ui.render();
             ui.setSettingsEnabled(true);
             ui.onSettingChange = async (key, value) => {
+                if (key === 'readingLock') {
+                    if (value) readingGuard.start();
+                    else readingGuard.stop();
+                }
                 await saveSettings();
                 if (key === 'autoLow' && value) lifecycle.scheduleScan();
                 if (key === 'strictGuard' && !value) ui.showAllowOnce(false);
-                state.statusMessage = `${key === 'autoLow' ? '自动 Low' : key === 'sendGuard' ? '发送保护' : key === 'strictGuard' ? '严格保护' : '调试日志'}设置已保存。`;
+                state.statusMessage = `${key === 'autoLow' ? '自动 Low' : key === 'sendGuard' ? '发送保护' : key === 'strictGuard' ? '严格保护' : key === 'readingLock' ? '固定阅读位置' : '调试日志'}设置已保存。`;
                 ui.render();
             };
             ui.onAllowOnce = () => {
@@ -2183,11 +2623,14 @@
                 state.statusMessage = '已准备本次放行；请再次发起发送以完成确认。';
                 ui.render();
             };
+            ui.onJumpToBottom = readingGuard.jumpToBottom;
             doc.addEventListener('click', manualEffortHandler, true);
             doc.addEventListener('keydown', manualEffortHandler, true);
             doc.addEventListener('change', manualEffortHandler, true);
             lifecycle.start();
             sendGuard.install();
+            if (state.settings.readingLock) readingGuard.start();
+            else readingGuard.stop();
             pointsService.updateNativePercent();
             effortManager.publish();
             pointsService.refreshQuietly('initial');
@@ -2214,6 +2657,7 @@
         mutationContainsMessages,
         effortDisplayName,
         createFixedCoalescer,
+        createReadingPositionGuard,
         retryBounded,
         createSingleFlight,
         decideSend,

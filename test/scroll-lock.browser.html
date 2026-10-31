@@ -1,0 +1,488 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>Poe 固定阅读位置 · 浏览器验证</title>
+<style>
+    body { margin: 24px; background: #f6f7fa; color: #242936; font: 15px/1.6 system-ui, sans-serif; }
+    h1 { margin-bottom: 4px; font-size: 24px; }
+    header p { margin-top: 0; color: #576171; }
+    button { padding: 8px 14px; cursor: pointer; }
+    main { display: flex; gap: 24px; align-items: flex-start; }
+    #chat { width: 600px; height: 380px; overflow-y: auto; border: 1px solid #b7bfcd;
+        border-radius: 10px; background: white; line-height: 24px; }
+    #chat.reversed { display: flex; flex-direction: column-reverse; }
+    #chat::-webkit-scrollbar { width: 14px; }
+    #chat::-webkit-scrollbar-track { background: #edf0f5; }
+    #chat::-webkit-scrollbar-thumb { background: #919db1; border: 2px solid #edf0f5; border-radius: 8px; }
+    #messages { padding: 16px 24px; flex: 0 0 auto; }
+    #messages p { margin: 12px 0; }
+    #messages pre { height: 80px; overflow: auto; background: #edf0f5; }
+    #results { padding-left: 22px; margin-top: 0; max-width: 600px; }
+    #results li { margin-bottom: 5px; }
+    .pass { color: #126338; }
+    .fail { color: #af2030; font-weight: 600; }
+    #summary { font-weight: 600; }
+</style>
+<header>
+    <h1>Poe 固定阅读位置 · 浏览器验证</h1>
+    <p>仅使用本机模拟消息，测试同一份用户脚本；不会访问 Poe 或发送问题。</p>
+    <button id="run" type="button">运行浏览器检查</button>
+    <button id="preview-start" type="button">开启手动体验</button>
+    <button id="preview-noise" type="button">模拟持续生成和跳动</button>
+    <button id="preview-bottom" type="button">体验底部自动跟随场景</button>
+    <button id="preview-stop" type="button">停止手动体验</button>
+    <p id="summary" role="status">尚未运行</p>
+</header>
+<main>
+    <section aria-label="模拟聊天">
+        <div id="chat" tabindex="0"><div id="messages"></div></div>
+        <p id="guard-state">阅读保护尚未开启</p>
+        <button id="native-bottom" aria-label="Scroll to bottom" type="button">Poe 原生回到底部（模拟）</button>
+        <label>输入区域 <textarea id="composer" aria-label="模拟输入框"></textarea></label>
+    </section>
+    <ol id="results"></ol>
+</main>
+<script>window.module = { exports: {} };</script>
+<script src="/Poe_Effort_Points.user.js"></script>
+<script>
+'use strict';
+const api = window.module.exports;
+delete window.module;
+let chat = document.getElementById('chat');
+const results = document.getElementById('results');
+const summary = document.getElementById('summary');
+const state = document.getElementById('guard-state');
+let previewGuard = null;
+let previewTimer = null;
+const previewCleanup = [];
+function stopPreview() {
+    for (const cleanup of previewCleanup.splice(0)) cleanup();
+    if (previewGuard) previewGuard.stop();
+    previewGuard = null;
+    clearInterval(previewTimer); previewTimer = null;
+}
+const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
+const frame = () => new Promise(requestAnimationFrame);
+async function flush() { await frame(); await frame(); await frame(); }
+function assert(condition, message) { if (!condition) throw new Error(message); }
+function near(actual, expected, message) { assert(Math.abs(actual - expected) <= 1, `${message}: ${actual} / ${expected}`); }
+function paragraph(text) { const element = document.createElement('p'); element.textContent = text; return element; }
+function makeMessages() {
+    const messages = document.createElement('div');
+    messages.id = 'messages';
+    for (let round = 1; round <= 3; round += 1) {
+        const message = document.createElement('article');
+        message.id = `message-${round}`;
+        message.dataset.complete = 'true';
+        for (let line = 1; line <= 22; line += 1) message.append(paragraph(`模拟回复 ${round} · 段落 ${line}。这段文字用于检查阅读位置，不含真实聊天。`));
+        messages.append(message);
+    }
+    return messages;
+}
+function reset(reversed = false) {
+    chat.replaceChildren(makeMessages());
+    chat.classList.toggle('reversed', reversed);
+    chat.scrollTop = reversed ? -700 : 700;
+    history.replaceState(null, '', `?case=${reversed ? 'reverse' : 'normal'}-${Date.now()}`);
+}
+function visibleParagraph() {
+    const box = chat.getBoundingClientRect();
+    return [...chat.querySelectorAll('p')].find(p => {
+        const rect = p.getBoundingClientRect();
+        return rect.top > box.top + 20 && rect.bottom < box.bottom;
+    });
+}
+function wheel(target, deltaY, options = {}) {
+    const event = new WheelEvent('wheel', { bubbles: true, cancelable: true, deltaY, ...options });
+    target.dispatchEvent(event);
+    return event;
+}
+async function run() {
+    stopPreview();
+    document.getElementById('run').disabled = true;
+    results.replaceChildren();
+    let passed = 0;
+    let failed = 0;
+    let guard;
+    let app;
+    const check = async (name, action) => {
+        const item = document.createElement('li');
+        try { await action(); passed += 1; item.className = 'pass'; item.textContent = `通过 · ${name}`; }
+        catch (error) { failed += 1; item.className = 'fail'; item.textContent = `失败 · ${name} · ${error.message}`; }
+        results.append(item);
+        summary.textContent = `${passed} 项通过，${failed} 项失败`;
+    };
+    try {
+        reset();
+        guard = api.createReadingPositionGuard(window, current => { state.textContent = `保护状态：${current.status}`; });
+        guard.start();
+        await wait(350); await flush();
+        await check('上下自动跳动均被阻止', async () => {
+            const top = chat.scrollTop;
+            chat.scrollTop = 0; await flush(); near(chat.scrollTop, top, '向上跳');
+            chat.scrollTo({ top: chat.scrollHeight, behavior: 'smooth' });
+            await wait(180); await flush(); near(chat.scrollTop, top, '平滑向下跳');
+        });
+        await check('持续生成并连续跳动，所读文字保持原位', async () => {
+            const reference = visibleParagraph();
+            const y = reference.getBoundingClientRect().top;
+            for (let index = 0; index < 16; index += 1) {
+                chat.querySelector('article:last-child').append(paragraph(`正在生成 · ${index}`));
+                chat.scrollTop -= 90;
+                await flush();
+                near(reference.getBoundingClientRect().top, y, '阅读文字位置');
+            }
+        });
+        await check('连续两次手动滚动后，紧随的自动跳动仍被阻止', async () => {
+            for (const delta of [-120, -60, 75]) {
+                const wanted = chat.scrollTop + delta;
+                const event = wheel(visibleParagraph(), delta);
+                assert(event.defaultPrevented, '应接管聊天滚动');
+                chat.scrollTop = 0;
+                await flush(); near(chat.scrollTop, wanted, '手动滚动目标');
+            }
+        });
+        await check('加载上方历史消息后，所读文字保持原位', async () => {
+            const reference = visibleParagraph();
+            const y = reference.getBoundingClientRect().top;
+            chat.querySelector('article').prepend(paragraph('刚载入的历史段落。'.repeat(12)));
+            await flush(); near(reference.getBoundingClientRect().top, y, '历史加载位置');
+        });
+        await check('上方图片尺寸变化后，所读文字保持原位', async () => {
+            const reference = visibleParagraph();
+            const y = reference.getBoundingClientRect().top;
+            const image = document.createElement('div');
+            image.style.height = '1px';
+            chat.querySelector('article').prepend(image);
+            await flush();
+            image.style.height = '130px';
+            await flush(); near(reference.getBoundingClientRect().top, y, '图片加载位置');
+        });
+        await check('方向键和 PageDown 可主动换阅读位置', async () => {
+            chat.focus({ preventScroll: true });
+            for (const [key, delta] of [['ArrowDown', 40], ['PageDown', chat.clientHeight * 0.9]]) {
+                const wanted = chat.scrollTop + delta;
+                const event = new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true });
+                chat.dispatchEvent(event); await flush();
+                assert(event.defaultPrevented, '应接管聊天方向键');
+                near(chat.scrollTop, wanted, key);
+            }
+        });
+        await check('代码块、输入框、菜单和横向滚动保持各自操作', async () => {
+            const nested = document.createElement('pre');
+            nested.textContent = '代码块\n'.repeat(30);
+            chat.querySelector('article').append(nested);
+            await flush();
+            const top = chat.scrollTop;
+            assert(!wheel(nested, 60).defaultPrevented, '代码块应保留自身滚动');
+            assert(!wheel(visibleParagraph(), 60, { deltaX: 150 }).defaultPrevented, '横向滚动应放行');
+            assert(!wheel(visibleParagraph(), 60, { ctrlKey: true }).defaultPrevented, '缩放应放行');
+            const composer = document.getElementById('composer');
+            const event = new KeyboardEvent('keydown', { key: 'ArrowUp', bubbles: true, cancelable: true });
+            composer.dispatchEvent(event);
+            assert(!event.defaultPrevented, '输入框按键不应被接管');
+            const menu = document.createElement('div'); menu.setAttribute('role', 'menu');
+            chat.querySelector('article').append(menu);
+            assert(!wheel(menu, 60).defaultPrevented, '菜单滚动不应被接管');
+            const menuKey = new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true });
+            menu.dispatchEvent(menuKey);
+            assert(!menuKey.defaultPrevented, '菜单按键不应被接管');
+            menu.remove();
+            await flush(); near(chat.scrollTop, top, '聊天位置');
+        });
+        await check('拖动滚动条后，停在新位置继续保护', async () => {
+            document.getElementById('preview-start').focus({ preventScroll: true });
+            const box = chat.getBoundingClientRect();
+            const pointer = window.PointerEvent ? PointerEvent : MouseEvent;
+            const prefix = window.PointerEvent ? 'pointer' : 'mouse';
+            chat.dispatchEvent(new pointer(`${prefix}down`, { bubbles: true, button: 0, clientX: box.right - 2, clientY: box.top + 60, pointerType: 'mouse' }));
+            chat.focus({ preventScroll: true }); // The old focused button blurs during a real drag.
+            chat.scrollTop = 470; await flush(); near(chat.scrollTop, 470, '拖动中');
+            document.dispatchEvent(new pointer(`${prefix}up`, { bubbles: true, button: 0 }));
+            chat.scrollTop = 0; await flush(); near(chat.scrollTop, 470, '拖动后固定');
+        });
+        await check('触屏手动滑动后，紧随的自动跳动被阻止', async () => {
+            const target = visibleParagraph();
+            const dispatch = (name, points) => {
+                const event = new Event(name, { bubbles: true, cancelable: true });
+                Object.defineProperty(event, 'touches', { value: points });
+                target.dispatchEvent(event);
+                return event;
+            };
+            const top = chat.scrollTop;
+            dispatch('touchstart', [{ clientX: 300, clientY: 300 }]);
+            const event = dispatch('touchmove', [{ clientX: 300, clientY: 220 }]);
+            assert(event.defaultPrevented, '接管垂直滑动');
+            dispatch('touchend', []);
+            chat.scrollTop = 0; await flush(); near(chat.scrollTop, top + 80, '触屏位置');
+        });
+        await check('Markdown 重建文字节点后，继续固定原阅读位置', async () => {
+            const top = chat.scrollTop;
+            for (const element of chat.querySelectorAll('article p')) element.replaceWith(element.cloneNode(true));
+            chat.scrollTop = 0;
+            await flush(); near(chat.scrollTop, top, '文字重建位置');
+        });
+        await check('原生回到底部可用，之后的新输出不再自动跟随', async () => {
+            document.getElementById('native-bottom').click(); await flush();
+            near(chat.scrollTop, chat.scrollHeight - chat.clientHeight, '回到底部');
+            const reference = visibleParagraph();
+            const y = reference.getBoundingClientRect().top;
+            chat.querySelector('article:last-child').append(paragraph('底部继续生成。'.repeat(30)));
+            chat.scrollTop = chat.scrollHeight;
+            await flush(); near(reference.getBoundingClientRect().top, y, '不自动跟随');
+        });
+        await check('关闭保护恢复原有样式和自动滚动', async () => {
+            guard.stop();
+            assert(!chat.style.getPropertyValue('overflow-anchor'), '应移除本功能添加的样式');
+            assert(!chat.style.getPropertyValue('scroll-behavior'), '应移除本功能添加的滚动样式');
+            chat.scrollTop = 0; await flush(); near(chat.scrollTop, 0, '关闭后滚动');
+        });
+        await check('重新开启不会覆盖页面原有的重要样式', async () => {
+            chat.style.setProperty('overflow-anchor', 'none', 'important');
+            chat.style.setProperty('scroll-behavior', 'smooth', 'important');
+            guard.start(); await wait(350); await flush();
+            guard.stop();
+            assert(chat.style.getPropertyValue('overflow-anchor') === 'none', '保留原有锚点样式');
+            assert(chat.style.getPropertyValue('scroll-behavior') === 'smooth', '恢复原有平滑滚动');
+            chat.removeAttribute('style');
+        });
+        await check('切换聊天时接受新位置，不带入上一聊天的位置', async () => {
+            guard.start(); await wait(350);
+            reset(); chat.scrollTop = 320;
+            guard.refresh();
+            chat.scrollTop = 540;
+            await wait(350); await flush(); near(chat.scrollTop, 540, '新聊天初始位置');
+            chat.scrollTop = 0; await flush(); near(chat.scrollTop, 540, '新聊天保护');
+        });
+        await check('聊天容器被重新创建后仍可固定位置', async () => {
+            const wanted = chat.scrollTop;
+            const replacement = chat.cloneNode(true);
+            // A newly rendered DOM node does not inherit the guard's inline
+            // styles. Do not clone those into the next independent fixture.
+            replacement.removeAttribute('style');
+            chat.replaceWith(replacement); chat = replacement;
+            chat.scrollTop = 430;
+            await wait(400); await flush();
+            chat.scrollTop = 0; await flush(); near(chat.scrollTop, wanted, '替换后保留原容器的阅读位置');
+        });
+        await check('反向消息列表支持负滚动位置和手动滚动', async () => {
+            reset(true); guard.refresh(); await wait(350); await flush();
+            near(chat.scrollTop, -700, '反向初始位置');
+            const wanted = chat.scrollTop - 100;
+            wheel(visibleParagraph(), -100);
+            chat.scrollTop = 0; await flush(); near(chat.scrollTop, wanted, '反向手动滚动');
+            guard.jumpToBottom(); await flush(); near(chat.scrollTop, 0, '反向回到底部');
+            const reference = visibleParagraph();
+            const y = reference.getBoundingClientRect().top;
+            chat.querySelector('article:last-child').append(paragraph('反向列表继续生成。'.repeat(20)));
+            chat.scrollTop = 0;
+            await flush(); near(reference.getBoundingClientRect().top, y, '反向底部不跟随');
+        });
+        await check('没有历史消息的短回答，增长后仍停在原处', async () => {
+            guard.stop(); reset();
+            chat.querySelector('#messages').replaceChildren();
+            guard.start(); await flush();
+            assert(!wheel(document.getElementById('native-bottom'), -60).defaultPrevented, '没有消息时不接管按钮滚轮');
+            const message = document.createElement('article'); message.id = 'message-4';
+            message.append(paragraph('第一段输出。'));
+            chat.querySelector('#messages').append(message);
+            await wait(350); await flush();
+            for (let index = 0; index < 30; index += 1) message.append(paragraph(`后续输出 ${index}`));
+            chat.scrollTop = chat.scrollHeight;
+            await flush(); near(chat.scrollTop, 0, '短回答增长位置');
+        });
+        guard.stop();
+        await check('整页滚动的布局同样支持位置固定和手动滚动', async () => {
+            reset();
+            chat.style.height = 'auto'; chat.style.overflowY = 'visible';
+            document.scrollingElement.scrollTop = 550;
+            guard.start(); await wait(350); await flush();
+            const root = document.scrollingElement;
+            const top = root.scrollTop;
+            root.scrollTop = 0; await flush(); near(root.scrollTop, top, '整页固定');
+            wheel(visibleParagraph(), 80);
+            root.scrollTop = 0; await flush(); near(root.scrollTop, top + 80, '整页手动滚动');
+            guard.stop();
+            chat.removeAttribute('style'); root.scrollTop = 0;
+        });
+        guard.stop();
+        await check('底部新回复带横向裁剪外框，仍可向上滚动', async () => {
+            reset();
+            const message = chat.querySelector('article:last-child');
+            const wrapper = document.createElement('div');
+            wrapper.style.overflowX = 'hidden';
+            message.replaceWith(wrapper); wrapper.append(message);
+            chat.scrollTop = chat.scrollHeight;
+            guard.start();
+            try {
+                await wait(350); await flush();
+                assert(getComputedStyle(wrapper).overflowY === 'auto', '复现外框计算出的纵向 overflow');
+                assert(wrapper.scrollHeight === wrapper.clientHeight, '外框本身没有纵向滚动空间');
+                const wanted = chat.scrollTop - 120;
+                wheel(visibleParagraph(), -120);
+                chat.scrollTop = chat.scrollHeight;
+                await flush(); near(chat.scrollTop, wanted, '新回复内向上滚动');
+            } finally { guard.stop(); }
+        });
+        await check('鼠标留在原生回到底部按钮上，仍可用滚轮向上读', async () => {
+            reset(); guard.start();
+            try {
+                await wait(350); await flush();
+                const button = document.getElementById('native-bottom');
+                button.click(); await flush();
+                const wanted = chat.scrollTop - 120;
+                const event = wheel(button, -120);
+                assert(event.defaultPrevented, '按钮上的滚轮应交给聊天区域');
+                chat.scrollTop = chat.scrollHeight;
+                await flush(); near(chat.scrollTop, wanted, '原生按钮上的滚轮位置');
+            } finally { guard.stop(); }
+        });
+        await check('Poe 在窗口层接管底部滚轮后，仍可向上离开底部', async () => {
+            reset(); chat.scrollTop = chat.scrollHeight;
+            const poeWheel = event => {
+                if (!chat.contains(event.target)) return;
+                event.stopPropagation();
+                chat.scrollTop = chat.scrollHeight;
+            };
+            window.addEventListener('wheel', poeWheel, true);
+            guard.start();
+            try {
+                await wait(350); await flush();
+                const wanted = chat.scrollTop - 120;
+                wheel(visibleParagraph(), -120);
+                await flush(); near(chat.scrollTop, wanted, '窗口接管后的阅读位置');
+            } finally { window.removeEventListener('wheel', poeWheel, true); guard.stop(); }
+        });
+        await check('到过底部后反复上滚，滚动回调不会持续拉回底部', async () => {
+            reset(); chat.scrollTop = chat.scrollHeight;
+            guard.start();
+            let siteScrolls = 0;
+            const poeFollow = () => {
+                siteScrolls += 1;
+                if (siteScrolls < 40) chat.scrollTop = chat.scrollHeight;
+            };
+            try {
+                await wait(350); await flush();
+                chat.addEventListener('scroll', poeFollow);
+                for (let index = 0; index < 4; index += 1) {
+                    const wanted = chat.scrollTop - 90;
+                    wheel(visibleParagraph(), -90);
+                    await flush(); near(chat.scrollTop, wanted, '底部上滚后的位置');
+                    const reference = visibleParagraph();
+                    const y = reference.getBoundingClientRect().top;
+                    chat.querySelector('article:last-child').append(paragraph('新一轮正在输出。'));
+                    await flush(); near(reference.getBoundingClientRect().top, y, '继续输出时的位置');
+                }
+                assert(siteScrolls > 0, '正常手动滚动仍应通知页面');
+            } finally { chat.removeEventListener('scroll', poeFollow); guard.stop(); }
+        });
+        await check('同一聊天重建容器时，不重新放行底部自动跟随', async () => {
+            reset(); chat.scrollTop = chat.scrollHeight;
+            guard.start();
+            try {
+                await wait(350); await flush();
+                wheel(visibleParagraph(), -120); await flush();
+                const wanted = chat.scrollTop;
+                const replacement = chat.cloneNode(true);
+                replacement.removeAttribute('style');
+                chat.replaceWith(replacement); chat = replacement;
+                chat.scrollTop = chat.scrollHeight;
+                await flush(); near(chat.scrollTop, wanted, '重建时保留原位置');
+                for (let index = 0; index < 4; index += 1) {
+                    chat.scrollTop = chat.scrollHeight;
+                    await flush(); near(chat.scrollTop, wanted, '重建后不放行跟随');
+                }
+            } finally { guard.stop(); }
+        });
+        guard.stop();
+        reset();
+        let saved = { autoLow: false, sendGuard: false, readingLock: false };
+        window.GM_getValue = () => saved;
+        window.GM_setValue = (key, value) => { saved = { ...value }; };
+        const originalFetch = window.fetch;
+        window.fetch = async url => ({ status: 200, url: new URL(url, location.href).href, text: async () => '<html></html>' });
+        try {
+            app = api.start(window);
+            await flush();
+            await check('整合脚本读取并尊重已保存的关闭设置', async () => {
+                assert(!app.state.settings.readingLock, '读取关闭设置');
+                assert(app.state.readingPosition.status === 'off', '应保持关闭');
+                assert(!app.ui.root.querySelector('#reading-lock').checked, '设置开关应关闭');
+            });
+            await check('面板开关和常驻回到底部按钮可用并保存', async () => {
+                app.ui.root.querySelector('#reading-lock').click();
+                await wait(350); await flush();
+                assert(saved.readingLock === true, '保存开启设置');
+                assert(app.state.readingPosition.status === 'locked', '开关启用保护');
+                const button = app.ui.root.querySelector('#reading-bottom');
+                assert(!button.hidden, '显示常驻按钮');
+                button.click(); await flush();
+                near(chat.scrollTop, chat.scrollHeight - chat.clientHeight, '面板回到底部');
+            });
+            await check('页面进入缓存时释放保护，返回后重新启用', async () => {
+                window.dispatchEvent(new PageTransitionEvent('pagehide', { persisted: true }));
+                assert(app.state.readingPosition.status === 'off', '离开时关闭');
+                window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: true }));
+                await wait(350); await flush();
+                assert(app.state.readingPosition.status === 'locked', '返回后启用');
+            });
+            await check('鼠标留在脚本回到底部按钮上，滚轮仍可向上读', async () => {
+                const button = app.ui.root.querySelector('#reading-bottom');
+                button.click(); await flush();
+                const wanted = chat.scrollTop - 120;
+                const event = new WheelEvent('wheel', { bubbles: true, composed: true, cancelable: true, deltaY: -120 });
+                button.dispatchEvent(event);
+                assert(event.defaultPrevented, '阴影 DOM 内按钮的滚轮应交给聊天区域');
+                chat.scrollTop = chat.scrollHeight;
+                await flush(); near(chat.scrollTop, wanted, '脚本按钮上的滚轮位置');
+            });
+            await check('停止整合脚本后，不残留保护或面板', async () => {
+                app.stop();
+                assert(!document.querySelector('[data-poe-effort-points-ui="root"]'), '移除面板');
+                assert(!chat.style.getPropertyValue('scroll-behavior'), '还原滚动样式');
+                chat.scrollTop = 0; await flush(); near(chat.scrollTop, 0, '停止后可自由滚动');
+            });
+        } finally { if (app) app.stop(); window.fetch = originalFetch; }
+    } finally {
+        if (guard) guard.stop();
+        if (app) app.stop();
+        summary.textContent = `浏览器检查结束：${passed} 项通过，${failed} 项失败`;
+        document.getElementById('run').disabled = false;
+    }
+}
+document.getElementById('run').addEventListener('click', run);
+document.getElementById('preview-start').addEventListener('click', () => {
+    stopPreview(); reset();
+    previewGuard = api.createReadingPositionGuard(window, current => { state.textContent = `保护状态：${current.status}`; });
+    previewGuard.start();
+});
+document.getElementById('preview-noise').addEventListener('click', () => {
+    if (!previewGuard || previewTimer !== null) return;
+    previewTimer = setInterval(() => {
+        chat.querySelector('article:last-child').append(paragraph('模拟正在生成的新文字。'));
+        chat.scrollTop -= 90;
+    }, 140);
+});
+document.getElementById('preview-stop').addEventListener('click', stopPreview);
+document.getElementById('preview-bottom').addEventListener('click', () => {
+    stopPreview(); reset();
+    const message = chat.querySelector('article:last-child');
+    const wrapper = document.createElement('div'); wrapper.style.overflowX = 'hidden';
+    message.replaceWith(wrapper); wrapper.append(message);
+    chat.scrollTop = chat.scrollHeight;
+    const follow = () => { chat.scrollTop = chat.scrollHeight; };
+    const intercept = event => {
+        if (!chat.contains(event.target)) return;
+        event.stopPropagation(); follow();
+    };
+    window.addEventListener('wheel', intercept, true);
+    chat.addEventListener('scroll', follow);
+    previewCleanup.push(() => window.removeEventListener('wheel', intercept, true), () => chat.removeEventListener('scroll', follow));
+    previewGuard = api.createReadingPositionGuard(window, current => { state.textContent = `底部跟随场景 · 保护状态：${current.status}`; });
+    previewGuard.start();
+    previewTimer = setInterval(() => { message.append(paragraph('新一轮继续输出，页面尝试跟随底部。')); follow(); }, 140);
+});
+document.getElementById('native-bottom').addEventListener('click', () => chat.scrollTo({ top: chat.scrollHeight, behavior: 'smooth' }));
+chat.replaceChildren(makeMessages());
+</script>
+</html>
